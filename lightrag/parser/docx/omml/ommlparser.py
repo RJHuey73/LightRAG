@@ -28,6 +28,29 @@ class OMMLParser:
         "lim": "\\lim",
     }
 
+    # Run properties (m:rPr), ECMA-376 Part 1, 22.1.2.
+    # ST_Script (m:scr) picks the math alphabet a run is rendered in.
+    SCRIPT_MAP = {
+        "roman": "\\mathrm",
+        "script": "\\mathscr",
+        "fraktur": "\\mathfrak",
+        "double-struck": "\\mathbb",
+        "sans-serif": "\\mathsf",
+        "monospace": "\\mathtt",
+    }
+    # ST_Style (m:sty) picks weight/slant. Used on its own when the run has no
+    # m:scr; alongside one, the bold variants nest around the alphabet instead
+    # because no single LaTeX command combines the two.
+    STYLE_MAP = {
+        "p": "\\mathrm",
+        "b": "\\mathbf",
+        "i": "\\mathit",
+        "bi": "\\boldsymbol",
+    }
+    BOLD_STYLES = frozenset({"b", "bi"})
+    # CT_OnOff values that mean "off" when spelled out on m:nor.
+    OFF_VALUES = frozenset({"0", "false", "off"})
+
     def _normalize_func_name(self, content: str) -> str:
         if not content:
             return content
@@ -63,11 +86,60 @@ class OMMLParser:
         return text
 
     def parse_r(self, root: Element) -> str:
-        # TODO: Add support for m:rPr and m:scr to support different character styles
-        #    For now, we just parse the text content of m:r
+        run_properties = None
         text = ""
         for child in root:
+            if child.tag == qn("m:rPr"):
+                run_properties = child
+                continue
             text += self.parse(child)
+        return self._apply_run_properties(text, run_properties)
+
+    def _apply_run_properties(self, text: str, run_properties: Element | None) -> str:
+        """
+        Wrap a run's text in the LaTeX math-alphabet commands its m:rPr asks for.
+
+        A run carries meaning in its styling: double-struck R is the reals, not a
+        variable named R. Runs with no m:rPr -- and runs whose content is empty or
+        whitespace -- are returned untouched, so equations that never styled a run
+        render exactly as before.
+
+        :param text: The already-parsed LaTeX content of the run.
+        :param run_properties: The run's m:rPr element, or None if it has none.
+        :return: The content, wrapped if the run properties call for it.
+        """
+        if run_properties is None or not text.strip():
+            return text
+
+        script = None
+        style = None
+        normal = False
+        for child in run_properties:
+            if child.tag == qn("m:scr"):
+                script = child.attrib.get(qn("m:val"))
+            elif child.tag == qn("m:sty"):
+                style = child.attrib.get(qn("m:val"))
+            elif child.tag == qn("m:nor"):
+                normal = child.attrib.get(qn("m:val")) not in self.OFF_VALUES
+
+        alphabet = self.SCRIPT_MAP.get(script) if script else None
+        if alphabet is None and normal:
+            # m:nor marks literal text that must not be italicised as a variable.
+            alphabet = "\\mathrm"
+
+        commands = []
+        if alphabet:
+            commands.append(alphabet)
+            if style in self.BOLD_STYLES:
+                commands.insert(0, "\\boldsymbol")
+        elif style:
+            command = self.STYLE_MAP.get(style)
+            if command:
+                commands.append(command)
+
+        # Innermost command is applied first so the last one wraps the rest.
+        for command in reversed(commands):
+            text = f"{command}{{{text}}}"
         return text
 
     def parse_t(self, root: Element):
