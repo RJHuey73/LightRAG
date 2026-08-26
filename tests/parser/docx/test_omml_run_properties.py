@@ -7,6 +7,8 @@ import pytest
 from lightrag.parser.docx.omml.ommlparser import OMMLParser
 
 
+pytestmark = pytest.mark.offline
+
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
 
