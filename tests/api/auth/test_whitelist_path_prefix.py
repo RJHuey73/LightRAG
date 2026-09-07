@@ -124,24 +124,35 @@ def test_health_stays_exempt_under_any_prefix(monkeypatch, api_prefix, mode):
 
 @pytest.mark.parametrize("mode", ["verbatim", "strip"])
 @pytest.mark.parametrize("api_prefix", ["/api/v1", "/site01"])
-def test_ollama_routes_stay_exempt_under_any_prefix(monkeypatch, api_prefix, mode):
-    """The default whitelist exists for Ollama-client compatibility, which the
-    old matcher lost under a non-colliding prefix."""
+def test_ollama_routes_require_auth_once_configured_under_any_prefix(
+    monkeypatch, api_prefix, mode
+):
+    """Auth-aware whitelist (Medium finding): once authentication is
+    configured, the default whitelist's ``/api/*`` entry must not exempt the
+    Ollama-compatible routes from auth -- under any prefix or forwarding mode
+    -- because that router invokes the LLM and can read the whole knowledge
+    base. A valid credential still reaches the route; only the auth
+    requirement changed, not reachability."""
     client = _client(monkeypatch, api_prefix)
 
-    response = client.get(_request_path(api_prefix, "/api/tags", mode))
-    assert response.status_code == 200
+    path = _request_path(api_prefix, "/api/tags", mode)
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers={"X-API-Key": API_KEY}).status_code == 200
 
 
 def test_no_prefix_behaviour_is_unchanged(monkeypatch):
     """The stability half: with no prefix the normalization is a no-op and every
-    verdict must be exactly what it was before this change."""
+    verdict must be exactly what it was before this change -- except
+    ``/api/tags``, which now requires auth like every other route once
+    ``auth_configured`` is set (see
+    ``test_ollama_routes_require_auth_once_configured_under_any_prefix``)."""
     client = _client(monkeypatch, "")
 
     assert client.get("/documents").status_code == 401
     assert client.delete("/documents").status_code == 401
     assert client.get("/health").status_code == 200
-    assert client.get("/api/tags").status_code == 200
+    assert client.get("/api/tags").status_code == 401
+    assert client.get("/api/tags", headers={"X-API-Key": API_KEY}).status_code == 200
 
 
 @pytest.mark.parametrize("mode", ["verbatim", "strip"])
