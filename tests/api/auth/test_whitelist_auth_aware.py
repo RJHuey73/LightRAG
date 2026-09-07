@@ -180,7 +180,5 @@ def test_api_key_only_configured_protects_the_ollama_routes(monkeypatch):
     client = _app(monkeypatch, auth_configured=False, api_key=API_KEY)
 
     assert client.get("/api/tags").status_code == 403
-    assert (
-        client.get("/api/tags", headers={"X-API-Key": API_KEY}).status_code == 200
-    )
+    assert client.get("/api/tags", headers={"X-API-Key": API_KEY}).status_code == 200
     assert client.get("/health").status_code == 200

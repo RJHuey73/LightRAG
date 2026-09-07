@@ -152,9 +152,7 @@ def test_no_prefix_behaviour_is_unchanged(monkeypatch):
     assert client.delete("/documents").status_code == 401
     assert client.get("/health").status_code == 200
     assert client.get("/api/tags").status_code == 401
-    assert (
-        client.get("/api/tags", headers={"X-API-Key": API_KEY}).status_code == 200
-    )
+    assert client.get("/api/tags", headers={"X-API-Key": API_KEY}).status_code == 200
 
 
 @pytest.mark.parametrize("mode", ["verbatim", "strip"])
