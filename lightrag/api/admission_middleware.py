@@ -115,7 +115,9 @@ class AdmissionMiddleware:
         ticket: Optional[AdmissionTicket] = None
         if rag is not None and _admission_capacity(rag) > 0:
             if not path_is_whitelisted(
-                scope, mount_prefix=self._api_prefix
+                scope,
+                mount_prefix=self._api_prefix,
+                api_key_configured=bool(self._api_key),
             ) and not credentials_accepted(
                 token=bearer_token(scope),
                 api_key_header_value=header_value(scope, b"x-api-key"),

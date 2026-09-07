@@ -301,7 +301,24 @@ def get_route_path(scope: Mapping[str, Any], mount_prefix: str = "") -> str:
     return path
 
 
-def path_is_whitelisted(scope: Mapping[str, Any], *, mount_prefix: str = "") -> bool:
+def _route_is_ollama_api(route: str) -> bool:
+    """Whether ``route`` (already stripped of any mount prefix, see
+    :func:`get_route_path`) falls inside the Ollama-compatible ``/api`` route
+    tree mounted by ``app.include_router(ollama_api.router, prefix="/api")``.
+
+    Matched on path-segment boundaries only -- the same rule a configured
+    ``/api/*`` whitelist entry uses -- so a sibling route that merely starts
+    with those characters (``/apikeys``) is not caught by this check.
+    """
+    return route == "/api" or route.startswith("/api/")
+
+
+def path_is_whitelisted(
+    scope: Mapping[str, Any],
+    *,
+    mount_prefix: str = "",
+    api_key_configured: bool = False,
+) -> bool:
     """Whether ``WHITELIST_PATHS`` exempts this request from authentication.
 
     Shared so every layer that has to answer "may this request skip auth?" uses
@@ -322,14 +339,39 @@ def path_is_whitelisted(scope: Mapping[str, Any], *, mount_prefix: str = "") -> 
     starts with those characters (``/graph/*`` must not exempt ``/graphs``). The
     catch-all ``/*`` compiles to an empty prefix and still matches everything,
     since every path starts with ``/``.
+
+    Auth-aware (GHSA-mmg5-8x8q-v934 follow-up): the shipped default
+    ``WHITELIST_PATHS=/health,/api/*`` exists so a zero-config deployment (no
+    ``AUTH_ACCOUNTS``, no ``LIGHTRAG_API_KEY``) keeps Ollama-client
+    compatibility out of the box -- harmless there, since every request is
+    already unauthenticated in that state regardless of the whitelist (see
+    :func:`credentials_accepted`). But once an operator configures ``either``
+    of those, leaving the Ollama-compatible ``/api`` route tree open defeats
+    the point of turning auth on: it invokes the LLM and can read the whole
+    knowledge base. So once ``auth_configured`` (module-level, from
+    ``AUTH_ACCOUNTS``) or ``api_key_configured`` (call-site-specific, since an
+    API key is not a fixed module value the way ``AUTH_ACCOUNTS`` is) is true,
+    a whitelist match that falls inside ``/api`` no longer exempts the
+    request -- only ``/health`` (and any other non-``/api`` entry an operator
+    added) still bypasses auth. This narrows *that one route tree* rather than
+    the whole whitelist, so a deliberately whitelisted, non-Ollama path is
+    unaffected.
     """
     route = get_route_path(scope, mount_prefix)
+    auth_required = auth_configured or api_key_configured
     for pattern, is_prefix in whitelist_patterns:
         if is_prefix:
-            if route == pattern or route.startswith(pattern + "/"):
-                return True
-        elif route == pattern:
-            return True
+            matched = route == pattern or route.startswith(pattern + "/")
+        else:
+            matched = route == pattern
+        if not matched:
+            continue
+        if auth_required and _route_is_ollama_api(route):
+            # This match would only have exempted the Ollama-compatible /api
+            # tree, and auth is configured -- keep checking other patterns
+            # (none can grant an exemption /api no longer has), don't return.
+            continue
+        return True
     return False
 
 
@@ -413,8 +455,11 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
         # The route path, not request.url.path: the latter still carries the
         # mount prefix (see get_route_path), and both the whitelist and the
         # renewal skip list below are written as unprefixed route paths.
+        # api_key_configured is passed through so the /api whitelist entry
+        # loses its auth bypass in API-key-only mode too, not just when
+        # AUTH_ACCOUNTS (module-level auth_configured) is set.
         path = get_route_path(request.scope)
-        if path_is_whitelisted(request.scope):
+        if path_is_whitelisted(request.scope, api_key_configured=api_key_configured):
             return  # Whitelist path, allow access
 
         # 2. Validate token first if provided in the request (Ensure 401 error if token is invalid)

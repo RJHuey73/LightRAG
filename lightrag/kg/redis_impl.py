@@ -9,6 +9,7 @@ import pipmaster as pm
 import configparser
 from contextlib import asynccontextmanager
 import threading
+from urllib.parse import urlsplit, urlunsplit
 
 if not pm.is_installed("redis"):
     pm.install("redis")
@@ -74,6 +75,56 @@ MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "200"))
 SOCKET_TIMEOUT = float(os.getenv("REDIS_SOCKET_TIMEOUT", "30.0"))
 SOCKET_CONNECT_TIMEOUT = float(os.getenv("REDIS_CONNECT_TIMEOUT", "10.0"))
 RETRY_ATTEMPTS = int(os.getenv("REDIS_RETRY_ATTEMPTS", "3"))
+
+
+def _redact_uri(uri: str) -> str:
+    """Mask any embedded credentials in a connection URI before it is ever
+    handed to a logger.
+
+    ``REDIS_URI`` commonly carries a password (and sometimes a username) in
+    its userinfo component (``redis://user:pass@host:port``), and this module
+    logs the URI on every pool creation, ref-count change, close, and
+    eviction-policy refusal -- at INFO/DEBUG/ERROR levels. Without this, any
+    log aggregator or loosely-permissioned log file captures the plaintext
+    Redis password on every server start or reconnect.
+
+    Uses ``urllib.parse`` rather than a naive string replace so this is robust
+    to URIs with no scheme, no port, a query string, or an IPv6 host, and so a
+    URI that carries no credentials at all is returned completely unchanged
+    rather than erroring or being mangled. Only the password (and a bare
+    username with no password) are ever masked -- the scheme, host, port,
+    path (db number), and query string all remain visible for debuggability.
+    """
+    try:
+        parsed = urlsplit(uri)
+    except ValueError:
+        # Malformed enough that urlsplit itself refuses it (e.g. an
+        # unbracketed IPv6 host) -- nothing left that is safe to parse, so
+        # mask wholesale rather than risk echoing a raw password verbatim.
+        return "***"
+
+    netloc = parsed.netloc
+    if "@" not in netloc:
+        return uri  # No userinfo component at all -- nothing to redact.
+
+    # rpartition, not partition: a password containing a literal "@" (poorly
+    # percent-encoded, but seen in the wild) must not truncate the host into
+    # the "userinfo" half.
+    userinfo, _, hostport = netloc.rpartition("@")
+    username, sep, _password = userinfo.partition(":")
+    if sep:
+        # An explicit ":" separator was present, i.e. a password field exists
+        # (even if empty) -- mask it. A username-only userinfo (no ":" at
+        # all) carries no secret and is left as-is for debuggability.
+        redacted_userinfo = f"{username}:***" if username else "***"
+    else:
+        redacted_userinfo = userinfo
+
+    redacted_netloc = f"{redacted_userinfo}@{hostport}"
+    return urlunsplit(
+        (parsed.scheme, redacted_netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
 
 # Tenacity retry decorator for Redis operations
 redis_retry = retry(
@@ -151,7 +202,7 @@ async def _ensure_no_eviction_policy(redis, redis_url: str, workspace: str) -> N
         )
         return
     raise StorageControlPlaneError(
-        f"[{workspace}] Redis at {redis_url} is configured as an evicting cache "
+        f"[{workspace}] Redis at {_redact_uri(redis_url)} is configured as an evicting cache "
         f"(maxmemory-policy='{policy}', maxmemory={maxmemory}), but LightRAG "
         f"stores doc_status, full_docs and the derived scheduling index there as "
         f"a system of record — none of those keys carry a TTL, so an "
@@ -177,6 +228,7 @@ class RedisConnectionManager:
     @classmethod
     def get_pool(cls, redis_url: str) -> ConnectionPool:
         """Get or create a connection pool for the given Redis URL"""
+        redacted_url = _redact_uri(redis_url)
         with cls._lock:
             if redis_url not in cls._pools:
                 cls._pools[redis_url] = ConnectionPool.from_url(
@@ -187,12 +239,12 @@ class RedisConnectionManager:
                     socket_connect_timeout=SOCKET_CONNECT_TIMEOUT,
                 )
                 cls._pool_refs[redis_url] = 0
-                logger.info(f"Created shared Redis connection pool for {redis_url}")
+                logger.info(f"Created shared Redis connection pool for {redacted_url}")
 
             # Increment reference count
             cls._pool_refs[redis_url] += 1
             logger.debug(
-                f"Redis pool {redis_url} reference count: {cls._pool_refs[redis_url]}"
+                f"Redis pool {redacted_url} reference count: {cls._pool_refs[redis_url]}"
             )
 
         return cls._pools[redis_url]
@@ -215,7 +267,8 @@ class RedisConnectionManager:
             if redis_url in cls._pool_refs:
                 cls._pool_refs[redis_url] -= 1
                 logger.debug(
-                    f"Redis pool {redis_url} reference count: {cls._pool_refs[redis_url]}"
+                    f"Redis pool {_redact_uri(redis_url)} reference count: "
+                    f"{cls._pool_refs[redis_url]}"
                 )
 
                 # If no more references, remove from registry and return for disconnect
@@ -235,13 +288,14 @@ class RedisConnectionManager:
         """
         pool = cls.release_pool_ref(redis_url)
         if pool is not None:
+            redacted_url = _redact_uri(redis_url)
             try:
                 await pool.aclose()
                 logger.info(
-                    f"Closed Redis connection pool for {redis_url} (no more references)"
+                    f"Closed Redis connection pool for {redacted_url} (no more references)"
                 )
             except Exception as e:
-                logger.error(f"Error closing Redis pool for {redis_url}: {e}")
+                logger.error(f"Error closing Redis pool for {redacted_url}: {e}")
 
     @classmethod
     async def close_all_pools(cls):
@@ -251,22 +305,24 @@ class RedisConnectionManager:
             cls._pools.clear()
             cls._pool_refs.clear()
         for url, pool in pools.items():
+            redacted_url = _redact_uri(url)
             try:
                 await pool.aclose()
-                logger.info(f"Closed Redis connection pool for {url}")
+                logger.info(f"Closed Redis connection pool for {redacted_url}")
             except Exception as e:
-                logger.error(f"Error closing Redis pool for {url}: {e}")
+                logger.error(f"Error closing Redis pool for {redacted_url}: {e}")
 
     @classmethod
     async def _close_pool_safely(cls, pool: ConnectionPool, redis_url: str) -> None:
         """Await ``pool.aclose()``, swallowing errors as best-effort cleanup."""
+        redacted_url = _redact_uri(redis_url)
         try:
             await pool.aclose()
             logger.info(
-                f"Closed Redis connection pool for {redis_url} (no more references)"
+                f"Closed Redis connection pool for {redacted_url} (no more references)"
             )
         except Exception as e:
-            logger.error(f"Error closing Redis pool for {redis_url}: {e}")
+            logger.error(f"Error closing Redis pool for {redacted_url}: {e}")
 
     @classmethod
     def schedule_pool_close(cls, pool: ConnectionPool, redis_url: str) -> None:
